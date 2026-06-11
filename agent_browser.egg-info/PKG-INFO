@@ -1,0 +1,236 @@
+Metadata-Version: 2.4
+Name: agent-browser
+Version: 0.2.0
+Summary: Thread-safe Chrome CDP controller for AI agents
+License: MIT
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+
+# agentBrowser
+
+Minimal Chrome controller for AI agents — CDP over Node.js, wrapped as a pip-installable Python library.
+
+Controls a real visible Chrome window. Thread-safe: each thread automatically gets its own Chrome port, profile directory, and state, so parallel agents never share a tab or interfere with each other's clicks.
+
+**Requires:** Python 3.11+, Node.js 22+, Google Chrome
+
+---
+
+## Installation
+
+```bash
+# From local path
+pip install -e C:/path/to/agentBrowser
+
+# From git
+pip install git+https://github.com/yourname/agentBrowser.git
+```
+
+---
+
+## Python API
+
+```python
+import agent_browser as ab
+
+# Navigate — returns snapshot with @ref IDs for every interactive element
+result = ab.navigate("https://example.com")
+# result = {
+#   "success": True,
+#   "url": "https://example.com",
+#   "snapshot": "- link \"About\" [ref=e1, url=...]\n- button \"Sign in\" [ref=e2]\n...",
+#   "refs": {"e1": {"role": "link", "name": "About", ...}, ...}
+# }
+
+# Refresh snapshot after a click or page change
+snap = ab.snapshot()
+
+# Interact using @ref IDs from the snapshot
+ab.click("e2")           # or ab.click("@e2")
+ab.type_text("hello")    # types into currently focused element
+ab.press_key("Enter")    # key names: Enter, Tab, Escape, ArrowDown, ...
+ab.scroll("down", 600)   # scroll down 600px
+ab.back()                # browser history back
+
+# Close this thread's Chrome instance when done
+ab.close_browser()
+```
+
+### One-shot search helpers
+
+Skip the navigate → find search box → click → type → submit flow:
+
+```python
+ab.google_search("machine learning papers 2024")
+ab.bing_search("site:github.com pytorch examples")
+ab.baidu_search("人工智能最新论文")
+ab.reddit_search("best async Python libraries")
+```
+
+Each returns the same dict as `navigate()`.
+
+---
+
+## Agent framework integration
+
+`agent_browser.tools` provides OpenAI-compatible tool definitions and a `dispatch()` function so you can plug directly into any LLM tool-calling loop:
+
+```python
+from agent_browser.tools import TOOL_DEFINITIONS, dispatch
+from openai import OpenAI
+import json
+
+client = OpenAI()
+messages = [{"role": "user", "content": "Search Google for recent LLM papers and tell me the top results"}]
+
+while True:
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        tools=TOOL_DEFINITIONS,
+    )
+    msg = response.choices[0].message
+    messages.append(msg)
+
+    if not msg.tool_calls:
+        print(msg.content)
+        break
+
+    for tc in msg.tool_calls:
+        args = json.loads(tc.function.arguments)
+        result = dispatch(tc.function.name, args)   # returns JSON string
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": result,
+        })
+```
+
+Available tools (12): `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_press_key`, `browser_scroll`, `browser_back`, `browser_close`, `google_search`, `bing_search`, `baidu_search`, `reddit_search`
+
+---
+
+## Profile setup (cookies / login state)
+
+By default each Chrome instance starts fresh. To give agents your login sessions:
+
+**Option A — Import cookies from your existing Chrome profile** (run with Chrome closed):
+
+```bash
+python -m agent_browser setup-profile
+# or: agent-browser setup-profile
+
+# To use a specific Chrome profile instead of auto-detecting:
+python -m agent_browser setup-profile "Profile 2"
+```
+
+**Option B — Log in manually inside an agent-managed Chrome window:**
+
+```bash
+python -m agent_browser login
+# or: agent-browser login
+```
+
+This opens Chrome with the agent profile. Log in to whatever sites you need, then close Chrome. Cookies are saved automatically.
+
+**How the profile is used at runtime:**
+
+```
+~/.agentbrowser/profiles/
+  shared/          ← your cookies/sessions (written by setup-profile or login)
+  run_<PID>/       ← per-run scratch copy of shared (created at agent startup)
+  <PID>_t1/        ← per-thread copy for worker thread 1
+  <PID>_t2/        ← per-thread copy for worker thread 2
+  ...
+```
+
+Each run and each thread gets its own copy, so a crashed agent never corrupts the shared profile, and parallel threads never share a Chrome session.
+
+To check what's configured:
+
+```bash
+python -m agent_browser info
+```
+
+---
+
+## Parallel use
+
+Each Python thread automatically gets a unique Chrome port and profile. No configuration needed:
+
+```python
+from concurrent.futures import ThreadPoolExecutor
+import agent_browser as ab
+
+def scrape(url: str) -> str:
+    result = ab.navigate(url)
+    # ... ab.click(), ab.snapshot(), etc.
+    # Each thread controls its own Chrome tab with its own cookies
+    ab.close_browser()
+    return result["snapshot"]
+
+urls = ["https://example.com", "https://github.com", "https://arxiv.org"]
+with ThreadPoolExecutor(max_workers=len(urls)) as pool:
+    snapshots = list(pool.map(scrape, urls))
+```
+
+Port layout: `base = 9222 + (PID % 100) * 10`. Thread 0 → base, thread 1 → base+1, etc. (10 slots per process, 100 process slots before wrapping). Override the base with `AGENT_BROWSER_PORT`.
+
+---
+
+## Environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGENT_BROWSER_PORT` | `9222 + (PID%100)*10` | Port base for this process; each thread adds its slot index |
+| `AGENT_BROWSER_PROFILES_DIR` | `~/.agentbrowser/profiles` | Root directory for all managed profiles |
+| `AGENT_BROWSER_PROFILE` | set automatically | Profile subdirectory name; set by `ensure_browser_profile()` |
+| `AGENT_BROWSER_STATE_DIR` | set per-thread | Per-thread dir for `session.json` and `refs.json`; set automatically |
+| `CHROME_PATH` | auto-detect | Override the Chrome executable path |
+
+---
+
+## Node.js CLI
+
+The underlying CLI can be used standalone without Python:
+
+```bash
+node src/cli.js start                         # launch Chrome on port 9222
+node src/cli.js open https://example.com      # navigate
+node src/cli.js snapshot --json               # dump interactive elements as JSON
+node src/cli.js click @e1                     # click by @ref
+node src/cli.js keyboard type "search query"  # type text
+node src/cli.js keyboard press Enter          # press a key
+node src/cli.js scroll down 800              # scroll
+node src/cli.js back                          # navigate back
+node src/cli.js close                         # close Chrome
+node src/cli.js screenshot page.png           # take screenshot
+```
+
+Same env vars apply: `AGENT_BROWSER_PORT`, `AGENT_BROWSER_STATE_DIR`, `AGENT_BROWSER_PROFILES_DIR`, `AGENT_BROWSER_PROFILE`, `CHROME_PATH`.
+
+---
+
+## Project structure
+
+```
+agentBrowser/
+├── pyproject.toml
+├── package.json
+├── src/
+│   ├── cli.js              ← Node.js CDP controller (canonical source)
+│   └── cdp.js              ← CDP WebSocket client
+├── agent_browser/          ← Python package (pip install target)
+│   ├── __init__.py         ← public API
+│   ├── _core.py            ← thread-local slots, CLI subprocess wrapper
+│   ├── _profile.py         ← shared/run/thread profile management
+│   ├── tools.py            ← TOOL_DEFINITIONS + dispatch() for LLM tool calling
+│   ├── __main__.py         ← python -m agent_browser setup-profile / login / info
+│   └── data/
+│       ├── cli.js          ← bundled copy of src/cli.js (for non-editable installs)
+│       └── cdp.js          ← bundled copy of src/cdp.js
+└── scripts/
+    └── google-smoke-test.js
+```
+
+`agent_browser/data/*.js` are copies of `src/*.js` — keep them in sync when modifying the CLI.

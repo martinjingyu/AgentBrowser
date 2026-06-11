@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+agent_browser/__init__.py
+agent_browser/__main__.py
+agent_browser/_core.py
+agent_browser/_profile.py
+agent_browser/tools.py
+agent_browser.egg-info/PKG-INFO
+agent_browser.egg-info/SOURCES.txt
+agent_browser.egg-info/dependency_links.txt
+agent_browser.egg-info/entry_points.txt
+agent_browser.egg-info/top_level.txt
+agent_browser/data/cdp.js
+agent_browser/data/cli.js

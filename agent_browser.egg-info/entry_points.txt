@@ -1,0 +1,2 @@
+[console_scripts]
+agent-browser = agent_browser.__main__:main

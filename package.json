@@ -1,0 +1,15 @@
+{
+  "name": "simple-agent-browser",
+  "version": "0.1.0",
+  "description": "Minimal visible Chrome controller over CDP.",
+  "type": "module",
+  "bin": {
+    "agent-browser-lite": "./src/cli.js"
+  },
+  "scripts": {
+    "check": "node --check src/cli.js && node --check src/cdp.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
