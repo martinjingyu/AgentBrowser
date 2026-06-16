@@ -58,27 +58,14 @@ def ensure_browser_profile() -> None:
 
 
 def cleanup_run_profile() -> None:
-    """Delete per-run scratch profiles created by ensure_browser_profile() and worker threads."""
-    import re
+    """Delete the per-run scratch profile created by ensure_browser_profile()."""
     slot = os.environ.get("AGENT_BROWSER_PROFILE", "")
-    profiles = _profiles_dir()
-    cleaned: list[str] = []
-
-    if slot.startswith("run_"):
-        dest = profiles / slot
-        if dest.exists():
-            shutil.rmtree(dest, ignore_errors=True)
-            cleaned.append(slot)
-
-    pid = str(os.getpid())
-    if profiles.exists():
-        for p in profiles.iterdir():
-            if re.fullmatch(rf"{re.escape(pid)}_t\d+", p.name) and p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-                cleaned.append(p.name)
-
-    if cleaned:
-        print(f"[Browser] Cleaned up scratch profiles: {', '.join(cleaned)}")
+    if not slot.startswith("run_"):
+        return
+    dest = _profiles_dir() / slot
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+        print(f"[Browser] Cleaned up scratch profile: {slot}")
 
 
 def cleanup_orphaned_browsers() -> None:
@@ -93,7 +80,7 @@ def cleanup_orphaned_browsers() -> None:
     for p in list(profiles.iterdir()):
         if not p.is_dir():
             continue
-        m = re.fullmatch(r"run_(\d+)", p.name) or re.fullmatch(r"(\d+)_t\d+", p.name)
+        m = re.fullmatch(r"run_(\d+)", p.name)
         if not m:
             continue
         old_pid = int(m.group(1))

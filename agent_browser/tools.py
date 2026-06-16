@@ -121,12 +121,15 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "google_search",
             "description": (
-                "Search Google. Returns a snapshot of the search results page. "
-                "Prefer for academic pages and international content."
+                "Search Google. Returns a structured list of results (title, url, snippet). "
+                "Use page=1, 2, ... to fetch subsequent result pages (each page has ~10 results)."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "page": {"type": "integer", "default": 0, "description": "Result page index, 0-based."},
+                },
                 "required": ["query"],
             },
         },
@@ -175,9 +178,9 @@ TOOL_DEFINITIONS: list[dict] = [
         "function": {
             "name": "browser_close",
             "description": (
-                "Close the Chrome instance for this thread and release the browser port. "
+                "Close this agent's browser tab and release its session. "
                 "Call when done with all browser actions to free resources. "
-                "The browser will be restarted automatically if browser tools are called again."
+                "A new tab will be created automatically if browser tools are called again."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
@@ -199,11 +202,11 @@ def dispatch(name: str, args: dict) -> str:
         "browser_press_key": lambda a: c.press_key(a["key"]),
         "browser_scroll":    lambda a: c.scroll(a.get("direction", "down"), int(a.get("pixels", 600))),
         "browser_back":      lambda a: c.back(),
-        "google_search":     lambda a: c.google_search(a["query"]),
+        "google_search":     lambda a: c.google_search(a["query"], int(a.get("page", 0))),
         "bing_search":       lambda a: c.bing_search(a["query"]),
         "baidu_search":      lambda a: c.baidu_search(a["query"]),
         "reddit_search":     lambda a: c.reddit_search(a["query"]),
-        "browser_close":     lambda a: c.close_browser(),
+        "browser_close":     lambda a: c.close_session(),
     }
 
     handler = handlers.get(name)

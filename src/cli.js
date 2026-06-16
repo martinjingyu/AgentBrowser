@@ -1,25 +1,41 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { connectPage, discoverBrowserWs, waitForLoad } from "./cdp.js";
+import { connectPage, connectBrowser, discoverBrowserWs, waitForLoad } from "./cdp.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const envPort = process.env.AGENT_BROWSER_PORT ? Number(process.env.AGENT_BROWSER_PORT) : null;
 const defaultPort = envPort ?? 9222;
-const stateDir = process.env.AGENT_BROWSER_STATE_DIR || join(root, ".agentbrowser");
-const profilesDir = process.env.AGENT_BROWSER_PROFILES_DIR || join(stateDir, "profiles");
-const statePath = join(stateDir, "session.json");
-const refsPath = join(stateDir, "refs.json");
+
+// Per-target session ID — when set, all commands route to this specific Chrome target
+const targetId = process.env.AGENT_BROWSER_TARGET_ID || null;
+
+// Global state dir: holds session.json (which Chrome port/headless mode)
+const globalStateDir = process.env.AGENT_BROWSER_STATE_DIR || join(homedir(), ".agentbrowser");
+const statePath = join(globalStateDir, "session.json");
+
+// Per-target state dir: holds refs.json (element refs for a specific session)
+const targetStateDir = targetId
+  ? join(homedir(), ".agentbrowser", "targets", targetId)
+  : globalStateDir;
+const refsPath = join(targetStateDir, "refs.json");
+
+const profilesDir = process.env.AGENT_BROWSER_PROFILES_DIR || join(globalStateDir, "profiles");
 
 function hasFlag(args, flag) {
   return args.includes(flag);
 }
 
-function ensureStateDir() {
-  mkdirSync(stateDir, { recursive: true });
+function ensureGlobalStateDir() {
+  mkdirSync(globalStateDir, { recursive: true });
+}
+
+function ensureTargetStateDir() {
+  mkdirSync(targetStateDir, { recursive: true });
 }
 
 function readState() {
@@ -31,8 +47,8 @@ function readState() {
 
 function writeState(state) {
   const toWrite = { ...state };
-  if (envPort !== null) delete toWrite.port;  // don't persist env-overridden port
-  ensureStateDir();
+  if (envPort !== null) delete toWrite.port;
+  ensureGlobalStateDir();
   writeFileSync(statePath, JSON.stringify(toWrite, null, 2));
 }
 
@@ -96,8 +112,8 @@ async function ensureChrome(port = defaultPort, options = {}) {
   const profileEnv = process.env.AGENT_BROWSER_PROFILE;
   const profileDir = profileEnv
     ? join(profilesDir, profileEnv)
-    : join(stateDir, `chrome-profile-${port}-${mode}`);
-  ensureStateDir();
+    : join(globalStateDir, `chrome-profile-${port}-${mode}`);
+  ensureGlobalStateDir();
   mkdirSync(profileDir, { recursive: true });
 
   const chrome = findChrome();
@@ -122,14 +138,40 @@ async function ensureChrome(port = defaultPort, options = {}) {
   throw new Error(`Chrome started but CDP was not ready on port ${port}`);
 }
 
+// Connect to a specific target (session) via the browser-level WebSocket.
+// Each CLI invocation attaches fresh — sessionId is connection-scoped, not persistent.
+async function attachTarget(cdp, tId) {
+  const result = await cdp.send("Target.attachToTarget", { targetId: tId, flatten: true });
+  const sessionId = result.sessionId;
+  // Enable required CDP domains for this session
+  await cdp.send("Page.enable", {}, sessionId);
+  await cdp.send("Runtime.enable", {}, sessionId);
+  await cdp.send("DOM.enable", {}, sessionId);
+  await cdp.send("Accessibility.enable", {}, sessionId);
+  await cdp.send("Network.enable", {}, sessionId);
+  return sessionId;
+}
+
 async function withPage(fn) {
   const state = readState();
-  await ensureChrome(state.port ?? defaultPort, { headless: state.headless });
-  const { cdp, sessionId } = await connectPage(state.port ?? defaultPort);
-  try {
-    return await fn(cdp, sessionId);
-  } finally {
-    await cdp.close();
+  const port = state.port ?? defaultPort;
+  await ensureChrome(port, { headless: state.headless });
+
+  if (targetId) {
+    const cdp = await connectBrowser(port);
+    try {
+      const sessionId = await attachTarget(cdp, targetId);
+      return await fn(cdp, sessionId);
+    } finally {
+      await cdp.close();
+    }
+  } else {
+    const { cdp, sessionId } = await connectPage(port);
+    try {
+      return await fn(cdp, sessionId);
+    } finally {
+      await cdp.close();
+    }
   }
 }
 
@@ -244,7 +286,7 @@ async function cmdSnapshot(args = []) {
     })()`;
 
     const items = await runtimeEval(cdp, sessionId, expression);
-    ensureStateDir();
+    ensureTargetStateDir();
     const refs = Object.fromEntries(items.map((item) => {
       const entry = {
         role: item.role,
@@ -274,13 +316,6 @@ async function cmdSnapshot(args = []) {
     }
 
     console.log(snapshot);
-    /*
-    for (const item of items) {
-      const desc = [item.ref, item.tag, item.type, item.text].filter(Boolean).join(" ");
-      console.log(`${desc} (${item.x},${item.y}) ${item.selector}`);
-    }
-    if (!items.length) console.log("no interactive elements found");
-    */
   });
 }
 
@@ -334,7 +369,7 @@ async function cmdClick(args) {
 }
 
 async function cmdScreenshot(args) {
-  const out = resolve(args[0] ?? join(stateDir, `screenshot-${Date.now()}.png`));
+  const out = resolve(args[0] ?? join(targetStateDir, `screenshot-${Date.now()}.png`));
   await withPage(async (cdp, sessionId) => {
     const res = await cdp.send("Page.captureScreenshot", {
       format: "png",
@@ -399,19 +434,6 @@ async function cmdKeyboard(args) {
   throw new Error("Usage: keyboard type <text> | keyboard press <key>");
 }
 
-async function cmdClose() {
-  const state = readState();
-  const port = state.port ?? defaultPort;
-  try {
-    const { cdp } = await connectPage(port);
-    try { await cdp.send("Browser.close"); } catch { /* ignore */ }
-    await cdp.close();
-    console.log(JSON.stringify({ success: true, closed: true }));
-  } catch {
-    console.log(JSON.stringify({ success: true, closed: false, note: "not running" }));
-  }
-}
-
 async function cmdBack() {
   await withPage(async (cdp, sessionId) => {
     await cdp.send("Page.goBack", {}, sessionId);
@@ -420,26 +442,199 @@ async function cmdBack() {
   });
 }
 
+// Create a new browser tab (target). With --isolated, creates a separate BrowserContext
+// so this session gets its own cookie jar. Without it, shares cookies with all other sessions.
+async function cmdCreateSession(args) {
+  const isolated = hasFlag(args, "--isolated");
+  const state = readState();
+  const port = state.port ?? defaultPort;
+  await ensureChrome(port, { headless: state.headless });
+
+  const cdp = await connectBrowser(port);
+  try {
+    let browserContextId;
+    if (isolated) {
+      const ctx = await cdp.send("Target.createBrowserContext", {});
+      browserContextId = ctx.browserContextId;
+    }
+
+    const params = { url: "about:blank" };
+    if (browserContextId) params.browserContextId = browserContextId;
+    const target = await cdp.send("Target.createTarget", params);
+
+    console.log(JSON.stringify({
+      success: true,
+      targetId: target.targetId,
+      browserContextId: browserContextId ?? null,
+    }));
+  } finally {
+    await cdp.close();
+  }
+}
+
+// Close the current session's target (and its BrowserContext if isolated).
+// Does NOT close the whole Chrome browser.
+async function cmdCloseSession(args) {
+  const tId = targetId || args[0];
+  if (!tId) throw new Error("No targetId: set AGENT_BROWSER_TARGET_ID or pass as argument");
+
+  const port = readState().port ?? defaultPort;
+  try {
+    const cdp = await connectBrowser(port);
+    try {
+      const { targetInfos } = await cdp.send("Target.getTargets", {});
+      const info = targetInfos?.find((t) => t.targetId === tId);
+
+      await cdp.send("Target.closeTarget", { targetId: tId });
+
+      // Dispose isolated BrowserContext (non-empty browserContextId = not the default context)
+      if (info?.browserContextId) {
+        try {
+          await cdp.send("Target.disposeBrowserContext", {
+            browserContextId: info.browserContextId,
+          });
+        } catch { /* default context cannot be disposed — ignore */ }
+      }
+
+      console.log(JSON.stringify({ success: true }));
+    } finally {
+      await cdp.close();
+    }
+  } catch {
+    console.log(JSON.stringify({ success: true, note: "browser not running" }));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Search result extractors
+// These are defined as real JS functions so .toString() serializes them
+// cleanly into a IIFE for runtimeEval — no string-escaping issues.
+// ---------------------------------------------------------------------------
+
+function googleResultExtractor() {
+  const seen = new Set();
+  const results = [];
+  for (const h3 of document.querySelectorAll('h3')) {
+    const a = h3.closest('a[href]');
+    if (!a) continue;
+    let url = a.href;
+    try {
+      const u = new URL(url);
+      // Unwrap Google's redirect wrapper (/url?q=...)
+      if (u.pathname === '/url') url = u.searchParams.get('q') || url;
+      if (u.hostname.includes('google.')) continue;
+    } catch { continue; }
+    if (!url || seen.has(url) || url.startsWith('#')) continue;
+    seen.add(url);
+    const title = h3.innerText.trim();
+    if (!title) continue;
+    // Walk up from the link to find descriptive snippet text in nearby spans
+    let snippet = '';
+    let el = a.parentElement;
+    for (let i = 0; i < 6 && el && !snippet; i++, el = el.parentElement) {
+      for (const s of el.querySelectorAll('span, em')) {
+        const t = (s.innerText || '').replace(/\s+/g, ' ').trim();
+        if (t.length > 60 && t.slice(0, 15) !== title.slice(0, 15)) {
+          snippet = t.slice(0, 280);
+          break;
+        }
+      }
+    }
+    results.push({ title, url, snippet });
+  }
+  return results;
+}
+
+function bingResultExtractor() {
+  const results = [];
+  for (const li of document.querySelectorAll('li.b_algo')) {
+    const a = li.querySelector('h2 a');
+    if (!a || !a.href) continue;
+    const title = a.innerText.trim();
+    const snippetEl = li.querySelector('.b_caption p, p.b_lineclamp3, p.b_lineclamp4, .b_algoSlug');
+    const snippet = (snippetEl?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+    results.push({ title, url: a.href, snippet });
+  }
+  return results;
+}
+
+function baiduResultExtractor() {
+  const results = [];
+  for (const item of document.querySelectorAll('.result, .c-container')) {
+    const a = item.querySelector('h3 a, .t a');
+    if (!a || !a.href) continue;
+    const title = a.innerText.trim();
+    const snippetEl = item.querySelector('.c-abstract, .content-right_8Zs40');
+    const snippet = (snippetEl?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 280);
+    results.push({ title, url: a.href, snippet });
+  }
+  return results;
+}
+
+async function waitForSelector(cdp, sessionId, selector, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const found = await runtimeEval(cdp, sessionId, `!!document.querySelector(${JSON.stringify(selector)})`);
+    if (found) return true;
+    await delay(250);
+  }
+  return false;
+}
+
+async function cmdSearchResults() {
+  await withPage(async (cdp, sessionId) => {
+    const origin = await runtimeEval(cdp, sessionId, 'location.href');
+
+    let extractor = googleResultExtractor;
+    let waitSelector = 'h3';
+    if (typeof origin === 'string') {
+      if (origin.includes('bing.com')) { extractor = bingResultExtractor; waitSelector = 'li.b_algo'; }
+      else if (origin.includes('baidu.com')) { extractor = baiduResultExtractor; waitSelector = '.result'; }
+    }
+
+    await waitForSelector(cdp, sessionId, waitSelector, 5000);
+
+    const results = await runtimeEval(cdp, sessionId, `(${extractor.toString()})()`);
+    console.log(JSON.stringify({ success: true, results: results ?? [], origin }));
+  });
+}
+
+// Close the entire Chrome browser process via CDP.
+async function cmdClose() {
+  const port = readState().port ?? defaultPort;
+  try {
+    const cdp = await connectBrowser(port);
+    try { await cdp.send("Browser.close"); } catch { /* ignore */ }
+    await cdp.close();
+    console.log(JSON.stringify({ success: true, closed: true }));
+  } catch {
+    console.log(JSON.stringify({ success: true, closed: false, note: "not running" }));
+  }
+}
+
 function usage() {
   console.log(`agentBrowser minimal CDP controller
 
 Commands:
-  node src/cli.js start [port] [--headless]  launch Chrome
-  node src/cli.js open <url>                  navigate current tab
-  node src/cli.js snapshot                    list interactive elements as @e refs
-  node src/cli.js click <@ref|selector|x,y>   click element
-  node src/cli.js screenshot [path]           save PNG screenshot
-  node src/cli.js scroll [pixels]             scroll by signed pixels
-  node src/cli.js scroll down [pixels]        scroll down
-  node src/cli.js scroll up [pixels]          scroll up
-  node src/cli.js keyboard type <text>        type text
-  node src/cli.js keyboard press <key>        press key
-  node src/cli.js back                        navigate back in history
-  node src/cli.js close                       close Chrome
+  node src/cli.js start [port] [--headless]    launch Chrome
+  node src/cli.js create-session [--isolated]  create a new browser tab; returns targetId
+  node src/cli.js close-session [targetId]     close a session tab (not the whole browser)
+  node src/cli.js open <url>                   navigate current tab
+  node src/cli.js snapshot                     list interactive elements as @e refs
+  node src/cli.js click <@ref|selector|x,y>    click element
+  node src/cli.js screenshot [path]            save PNG screenshot
+  node src/cli.js scroll [pixels]              scroll by signed pixels
+  node src/cli.js scroll down [pixels]         scroll down
+  node src/cli.js scroll up [pixels]           scroll up
+  node src/cli.js keyboard type <text>         type text
+  node src/cli.js keyboard press <key>         press key
+  node src/cli.js back                         navigate back in history
+  node src/cli.js close                        close entire Chrome browser
 
 Environment:
   AGENT_BROWSER_PORT          override CDP port (default: 9222)
-  AGENT_BROWSER_STATE_DIR     override state dir (session.json, refs.json)
+  AGENT_BROWSER_TARGET_ID     route all commands to this Chrome target (tab)
+  AGENT_BROWSER_STATE_DIR     override global state dir (session.json)
   AGENT_BROWSER_PROFILES_DIR  base directory for managed profiles
   AGENT_BROWSER_PROFILE       profile name within AGENT_BROWSER_PROFILES_DIR
   CHROME_PATH                 override Chrome executable path
@@ -458,6 +653,9 @@ async function main() {
     console.log(`${headless ? "headless" : "visible"} Chrome ready on CDP port ${port}`);
     return;
   }
+  if (cmd === "create-session") return cmdCreateSession(args);
+  if (cmd === "close-session") return cmdCloseSession(args);
+  if (cmd === "search-results") return cmdSearchResults();
   if (cmd === "open") return cmdOpen(args);
   if (cmd === "snapshot") return cmdSnapshot(args);
   if (cmd === "click") return cmdClick(args);

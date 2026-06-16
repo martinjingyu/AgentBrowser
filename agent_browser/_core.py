@@ -3,9 +3,8 @@ from __future__ import annotations
 import atexit
 import json
 import os
-import shutil
 import subprocess
-import threading
+from contextvars import ContextVar
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -14,8 +13,8 @@ from pathlib import Path
 
 def _find_cli() -> Path:
     candidates = [
-        Path(__file__).parent / "data" / "cli.js",        # installed package (pip install .)
-        Path(__file__).parent.parent / "src" / "cli.js",  # editable install (pip install -e .)
+        Path(__file__).parent.parent / "src" / "cli.js",  # dev: src/ takes priority when repo is present
+        Path(__file__).parent / "data" / "cli.js",        # fallback for pip-installed packages
     ]
     for p in candidates:
         if p.exists():
@@ -28,39 +27,20 @@ def _find_cli() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Port + thread-slot allocation
+# Session management via ContextVar
+#
+# One Chrome instance runs on _BROWSER_PORT (shared across all agents).
+# Each agent gets its own browser tab (CDP Target), identified by target_id.
+# The ContextVar isolates sessions across asyncio Tasks and threads automatically:
+#   - asyncio: each Task inherits a copy of the parent context at creation time
+#   - threading: each thread inherits a copy of the spawning thread's context
+# In both cases, setting a session inside a task/thread only affects that task/thread.
 # ---------------------------------------------------------------------------
 
-_PROC_PID = os.getpid()
-_BROWSER_PORT_BASE = int(os.getenv("AGENT_BROWSER_PORT", str(9222 + (_PROC_PID % 100) * 10)))
-_BROWSER_INSTANCE_BASE = os.getenv("AGENT_BROWSER_INSTANCE", str(_PROC_PID))
+_BROWSER_PORT = int(os.getenv("AGENT_BROWSER_PORT", "9222"))
 
-_thread_local = threading.local()
-_slot_lock = threading.Lock()
-_slot_counter = [0]
-
-_active_ports: set[int] = set()
-_active_ports_lock = threading.Lock()
-
-
-def _thread_slot() -> tuple[int, str, int]:
-    """Return (port, instance_id, slot_index) unique to the calling thread, allocated lazily."""
-    if not hasattr(_thread_local, "port"):
-        with _slot_lock:
-            idx = _slot_counter[0]
-            _slot_counter[0] += 1
-        _thread_local.port = _BROWSER_PORT_BASE + idx
-        _thread_local.instance = (
-            _BROWSER_INSTANCE_BASE if idx == 0
-            else f"{_BROWSER_INSTANCE_BASE}_t{idx}"
-        )
-        _thread_local.idx = idx
-    return _thread_local.port, _thread_local.instance, _thread_local.idx
-
-
-def _mark_port_active(port: int) -> None:
-    with _active_ports_lock:
-        _active_ports.add(port)
+# {"target_id": str, "browser_context_id": str | None}
+_current_session: ContextVar[dict | None] = ContextVar("browser_session", default=None)
 
 
 def _kill_chrome_on_port(port: int) -> None:
@@ -86,82 +66,57 @@ def _kill_chrome_on_port(port: int) -> None:
 
 
 def _atexit_cleanup() -> None:
-    with _active_ports_lock:
-        ports = set(_active_ports)
-    for port in ports:
-        _kill_chrome_on_port(port)
+    _kill_chrome_on_port(_BROWSER_PORT)
 
 
 atexit.register(_atexit_cleanup)
 
 
 # ---------------------------------------------------------------------------
-# Profile management for worker threads
-# ---------------------------------------------------------------------------
-
-def _ensure_worker_profile(instance: str) -> str:
-    """Copy the run profile to a per-thread directory on first use."""
-    if getattr(_thread_local, "profile_ready", False):
-        return instance
-
-    from ._profile import _profiles_dir
-    dest = _profiles_dir() / instance
-    if not dest.exists():
-        run_profile = os.environ.get("AGENT_BROWSER_PROFILE", "")
-        src = _profiles_dir() / run_profile if run_profile else None
-        if src and src.exists():
-            try:
-                def _copy2_skip_locked(s, d):
-                    try:
-                        shutil.copy2(s, d)
-                    except OSError:
-                        pass
-
-                shutil.copytree(
-                    src, dest,
-                    ignore=shutil.ignore_patterns("*.tmp", "LOG", "LOCK", "*.lock"),
-                    copy_function=_copy2_skip_locked,
-                )
-                print(f"[Browser] Copied run profile → profiles/{instance}/")
-            except Exception as e:
-                print(f"[Browser] Could not copy run profile for {instance}: {e}")
-
-    _thread_local.profile_ready = True
-    return instance
-
-
-def _cli_env() -> dict[str, str]:
-    """Build subprocess env dict for the calling thread's browser slot."""
-    from ._profile import ensure_browser_profile, _profiles_dir
-    ensure_browser_profile()
-
-    port, instance, idx = _thread_slot()
-    env = dict(os.environ)
-    env["AGENT_BROWSER_PORT"] = str(port)
-    env["AGENT_BROWSER_INSTANCE"] = instance
-    # Per-thread state dir prevents refs.json from being shared across parallel instances
-    env["AGENT_BROWSER_STATE_DIR"] = str(Path.home() / ".agentbrowser" / instance)
-    env["AGENT_BROWSER_PROFILES_DIR"] = str(_profiles_dir())
-    if idx != 0:
-        env["AGENT_BROWSER_PROFILE"] = _ensure_worker_profile(instance)
-    return env
-
-
-# ---------------------------------------------------------------------------
 # CLI runner
 # ---------------------------------------------------------------------------
 
-def _run(command: str, *args: str, timeout: int = 60) -> dict:
-    """Run agentBrowser CLI. Returns dict with at least {"success": bool}."""
+def _base_env() -> dict[str, str]:
+    """Env vars needed for any CLI call (port + profile), without session routing."""
+    from ._profile import ensure_browser_profile, _profiles_dir
+    ensure_browser_profile()
+    env = dict(os.environ)
+    env["AGENT_BROWSER_PORT"] = str(_BROWSER_PORT)
+    env["AGENT_BROWSER_PROFILES_DIR"] = str(_profiles_dir())
+    return env
+
+
+def _cli_env() -> dict[str, str]:
+    """Build subprocess env for the calling context's browser session.
+
+    Auto-creates a session on first use if none is bound to this context.
+    """
+    session = _current_session.get()
+    if session is None:
+        result = _run_raw("create-session", env=_base_env())
+        if not result.get("success"):
+            raise RuntimeError(f"Failed to create browser session: {result.get('error')}")
+        session = {
+            "target_id": result["targetId"],
+            "browser_context_id": result.get("browserContextId"),
+        }
+        _current_session.set(session)
+
+    env = _base_env()
+    env["AGENT_BROWSER_TARGET_ID"] = session["target_id"]
+    env["AGENT_BROWSER_STATE_DIR"] = str(
+        Path.home() / ".agentbrowser" / "targets" / session["target_id"]
+    )
+    return env
+
+
+def _run_raw(command: str, *args: str, env: dict, timeout: int = 60) -> dict:
+    """Run agentBrowser CLI with a fully-specified env dict."""
     cli = _find_cli()
     cmd = ["node", str(cli), command, *args]
     kwargs: dict = {}
     if os.name == "nt":
         kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
-
-    env = _cli_env()
-    port, _, _ = _thread_slot()
-    _mark_port_active(port)
 
     try:
         proc = subprocess.run(
@@ -189,13 +144,71 @@ def _run(command: str, *args: str, timeout: int = 60) -> dict:
     return {"success": True, "output": stdout}
 
 
+def _run(command: str, *args: str, timeout: int = 60) -> dict:
+    """Run agentBrowser CLI routed to the current context's session."""
+    return _run_raw(command, *args, env=_cli_env(), timeout=timeout)
+
+
 def _run_recovering(command: str, *args: str, timeout: int = 60) -> dict:
-    """Run a CDP command; on session freeze restart the browser and retry once."""
+    """Run a CDP command; on session freeze close and recreate the session, then retry once."""
     result = _run(command, *args, timeout=timeout)
     if not result.get("success") and "CDP command timed out" in result.get("error", ""):
-        print(f"[Browser] CDP timeout on '{command}', restarting and retrying...")
-        close_browser()
+        print(f"[Browser] CDP timeout on '{command}', recreating session and retrying...")
+        close_session()
         result = _run(command, *args, timeout=timeout)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle
+# ---------------------------------------------------------------------------
+
+def create_session(isolated: bool = False) -> dict:
+    """Explicitly create a new browser session for this context.
+
+    isolated=True creates a separate BrowserContext (own cookie jar).
+    Without it, the session shares cookies with all other sessions (same Chrome profile).
+    Sessions are normally created automatically on first browser call — only call this
+    if you need to control the lifecycle explicitly or want an isolated cookie jar.
+    """
+    args = ["--isolated"] if isolated else []
+    result = _run_raw("create-session", *args, env=_base_env())
+    if not result.get("success"):
+        raise RuntimeError(f"Failed to create browser session: {result.get('error')}")
+    session = {
+        "target_id": result["targetId"],
+        "browser_context_id": result.get("browserContextId"),
+    }
+    _current_session.set(session)
+    return session
+
+
+def close_session() -> dict:
+    """Close this context's browser tab. Does not shut down the whole Chrome browser.
+
+    After closing, the next browser call will auto-create a fresh session.
+    """
+    session = _current_session.get()
+    if session is None:
+        return {"success": True, "note": "no session to close"}
+    result = _run_raw(
+        "close-session", session["target_id"],
+        env=_base_env(),
+        timeout=15,
+    )
+    _current_session.set(None)
+    return result
+
+
+def close_browser() -> dict:
+    """Shut down the entire Chrome browser process.
+
+    Prefer close_session() to release just this agent's tab.
+    Use this only when you want to fully terminate Chrome.
+    """
+    result = _run_raw("close", env=_base_env(), timeout=15)
+    _current_session.set(None)
+    _kill_chrome_on_port(_BROWSER_PORT)
     return result
 
 
@@ -280,33 +293,41 @@ def back() -> dict:
     return {"success": True}
 
 
-def close_browser() -> dict:
-    """Close the Chrome instance for this thread."""
-    port, _, _ = _thread_slot()
-    _run("close", timeout=15)
-    _kill_chrome_on_port(port)
-    with _active_ports_lock:
-        _active_ports.discard(port)
-    return {"success": True}
-
-
 # ---------------------------------------------------------------------------
 # Search helpers
 # ---------------------------------------------------------------------------
 
-def google_search(query: str) -> dict:
+def _search(url: str, query: str) -> dict:
+    """Navigate to a search URL then extract structured results."""
+    nav = _run_recovering("open", url, timeout=30)
+    if not nav.get("success"):
+        return nav
+    result = _run("search-results", timeout=30)
+    if not result.get("success"):
+        return result
+    return {
+        "success": True,
+        "query": query,
+        "results": result.get("results", []),
+    }
+
+
+def google_search(query: str, page: int = 0) -> dict:
     from urllib.parse import quote_plus
-    return navigate(f"https://www.google.com/search?q={quote_plus(query)}")
+    url = f"https://www.google.com/search?q={quote_plus(query)}"
+    if page:
+        url += f"&start={page * 10}"
+    return _search(url, query)
 
 
 def bing_search(query: str) -> dict:
     from urllib.parse import quote_plus
-    return navigate(f"https://www.bing.com/search?q={quote_plus(query)}")
+    return _search(f"https://www.bing.com/search?q={quote_plus(query)}", query)
 
 
 def baidu_search(query: str) -> dict:
     from urllib.parse import quote_plus
-    return navigate(f"https://www.baidu.com/s?wd={quote_plus(query)}")
+    return _search(f"https://www.baidu.com/s?wd={quote_plus(query)}", query)
 
 
 def reddit_search(query: str) -> dict:

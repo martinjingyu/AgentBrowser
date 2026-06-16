@@ -143,6 +143,13 @@ export async function connectPage(port) {
   return { cdp, sessionId: undefined, targetId: undefined };
 }
 
+export async function connectBrowser(port) {
+  const wsUrl = await discoverBrowserWs(port);
+  const cdp = new CdpConnection(wsUrl);
+  await cdp.connect();
+  return cdp;
+}
+
 export async function waitForLoad(cdp, sessionId, timeoutMs = 15000) {
   try {
     await cdp.waitForEvent("Page.loadEventFired", sessionId, timeoutMs);

@@ -35,6 +35,17 @@ export class CdpConnection {
     this.events = [];
   }
 
+  // Decode WebSocket message data to a string synchronously.
+  // In Node.js, WebSocket messages are strings or ArrayBuffers — never Blobs.
+  // Keeping this synchronous eliminates microtask gaps between message arrival
+  // and event dispatch, which previously caused waitForEvent to miss events.
+  _decode(data) {
+    if (typeof data === "string") return data;
+    if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
+    if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8");
+    return String(data);
+  }
+
   async connect() {
     this.ws = new WebSocket(this.wsUrl);
     this.ws.binaryType = "arraybuffer";
@@ -50,8 +61,9 @@ export class CdpConnection {
       }, { once: true });
     });
 
-    this.ws.addEventListener("message", async (event) => {
-      const msg = JSON.parse(await messageText(event.data));
+    // Synchronous handler: no await, so events land in this.events immediately.
+    this.ws.addEventListener("message", (event) => {
+      const msg = JSON.parse(this._decode(event.data));
       if (msg.id && this.pending.has(msg.id)) {
         const { resolve, reject } = this.pending.get(msg.id);
         this.pending.delete(msg.id);
@@ -108,8 +120,9 @@ export class CdpConnection {
         this.ws.removeEventListener("message", listener);
         reject(new Error(`Timed out waiting for ${method}`));
       }, timeoutMs);
-      const listener = async (event) => {
-        const msg = JSON.parse(await messageText(event.data));
+      // Synchronous listener — same reason as the connect() handler above.
+      const listener = (event) => {
+        const msg = JSON.parse(this._decode(event.data));
         if (msg.method === method && (!sessionId || msg.sessionId === sessionId)) {
           clearTimeout(timer);
           this.ws.removeEventListener("message", listener);
@@ -143,10 +156,54 @@ export async function connectPage(port) {
   return { cdp, sessionId: undefined, targetId: undefined };
 }
 
-export async function waitForLoad(cdp, sessionId, timeoutMs = 15000) {
-  try {
-    await cdp.waitForEvent("Page.loadEventFired", sessionId, timeoutMs);
-  } catch {
-    // SPA and about:blank navigations may not produce a useful load signal.
-  }
+export async function connectBrowser(port) {
+  const wsUrl = await discoverBrowserWs(port);
+  const cdp = new CdpConnection(wsUrl);
+  await cdp.connect();
+  return cdp;
+}
+
+// Load signals, fastest to slowest:
+//   frameNavigated      — main frame HTML received (~1-3s)
+//   domContentEventFired — DOM parsed, before external resources
+//   loadEventFired      — all resources done; skipped entirely by SPAs
+const _LOAD_SIGNALS = new Set([
+  "Page.frameNavigated",
+  "Page.domContentEventFired",
+  "Page.loadEventFired",
+]);
+
+export function waitForLoad(cdp, sessionId, timeoutMs = 10000) {
+  // Check buffer first — the signal may have already arrived.
+  const found = cdp.events.find(
+    (e) => _LOAD_SIGNALS.has(e.method) && (!sessionId || e.sessionId === sessionId)
+  );
+  if (found) return Promise.resolve();
+
+  // Single listener + single timer so there are no dangling promises/timers
+  // after the first signal fires (Promise.race leaves orphaned timers that keep
+  // the Node.js process alive for their full duration).
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cdp.ws.removeEventListener("message", listener);
+      resolve();
+    };
+
+    const timer = setTimeout(finish, timeoutMs);
+
+    const listener = (event) => {
+      if (settled) return;
+      const msg = JSON.parse(cdp._decode(event.data));
+      if (_LOAD_SIGNALS.has(msg.method) && (!sessionId || msg.sessionId === sessionId)) {
+        finish();
+      }
+    };
+
+    cdp.ws.addEventListener("message", listener);
+  });
 }
