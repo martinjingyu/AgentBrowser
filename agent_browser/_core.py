@@ -3,7 +3,9 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import re
 import subprocess
+import time
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -219,12 +221,24 @@ def close_browser() -> dict:
 _NAVIGATE_SNAPSHOT_LIMIT = 8000
 
 
+_EMPTY_SNAPSHOT = frozenset({"", "(no interactive elements)"})
+_RENDER_RETRY_DELAYS = (0.8, 1.5)  # seconds; only paid when page looks empty
+
+
 def navigate(url: str) -> dict:
     """Navigate to URL and return a truncated snapshot of the loaded page."""
     result = _run_recovering("open", url, timeout=30)
     if not result.get("success"):
         return result
     snap = snapshot()
+    # waitForLoad resolves on the earliest of frameNavigated / domContentEventFired /
+    # loadEventFired, often before JS has rendered interactive elements.  If the
+    # snapshot looks empty, wait briefly and retry — adds no overhead on fast pages.
+    for delay in _RENDER_RETRY_DELAYS:
+        if snap.get("snapshot", "").strip() not in _EMPTY_SNAPSHOT:
+            break
+        time.sleep(delay)
+        snap = snapshot()
     text = snap.get("snapshot", "")
     truncated = len(text) > _NAVIGATE_SNAPSHOT_LIMIT
     if truncated:
@@ -297,6 +311,17 @@ def back() -> dict:
 # Search helpers
 # ---------------------------------------------------------------------------
 
+_SITE_RE = re.compile(r'\bsite:([A-Za-z0-9-]+)(?:\.[A-Za-z0-9-]+)*(?:/\S*)?')
+
+
+def _normalize_query(query: str) -> str:
+    """Strip TLD and path from site: operators to reduce bot-detection risk.
+
+    'pytorch tutorial site:github.com/pytorch' → 'pytorch tutorial site:github'
+    """
+    return _SITE_RE.sub("", query).strip()
+
+
 def _search(url: str, query: str) -> dict:
     """Navigate to a search URL then extract structured results."""
     nav = _run_recovering("open", url, timeout=30)
@@ -314,20 +339,29 @@ def _search(url: str, query: str) -> dict:
 
 def google_search(query: str, page: int = 0) -> dict:
     from urllib.parse import quote_plus
+    query = _normalize_query(query)
     url = f"https://www.google.com/search?q={quote_plus(query)}"
     if page:
         url += f"&start={page * 10}"
     return _search(url, query)
 
 
-def bing_search(query: str) -> dict:
+def bing_search(query: str, page: int = 0) -> dict:
     from urllib.parse import quote_plus
-    return _search(f"https://www.bing.com/search?q={quote_plus(query)}", query)
+    query = _normalize_query(query)
+    url = f"https://www.bing.com/search?q={quote_plus(query)}"
+    if page:
+        url += f"&first={page * 10 + 1}"
+    return _search(url, query)
 
 
-def baidu_search(query: str) -> dict:
+def baidu_search(query: str, page: int = 0) -> dict:
     from urllib.parse import quote_plus
-    return _search(f"https://www.baidu.com/s?wd={quote_plus(query)}", query)
+    query = _normalize_query(query)
+    url = f"https://www.baidu.com/s?wd={quote_plus(query)}"
+    if page:
+        url += f"&pn={page * 10}"
+    return _search(url, query)
 
 
 def reddit_search(query: str) -> dict:

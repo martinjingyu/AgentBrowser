@@ -163,20 +163,24 @@ export async function connectBrowser(port) {
   return cdp;
 }
 
-// Load signals, fastest to slowest:
-//   frameNavigated      — main frame HTML received (~1-3s)
-//   domContentEventFired — DOM parsed, before external resources
-//   loadEventFired      — all resources done; skipped entirely by SPAs
-const _LOAD_SIGNALS = new Set([
-  "Page.frameNavigated",
-  "Page.domContentEventFired",
-  "Page.loadEventFired",
-]);
+// Wait for the page load event that fires after all synchronous resources are done.
+// We intentionally skip frameNavigated / domContentEventFired: those fire too early
+// (before JS has rendered interactive elements on traditional server-rendered pages).
+// SPAs that never fire loadEventFired are handled by the 10 s timeout fallback.
+const _LOAD_SIGNAL = "Page.loadEventFired";
+
+// Remove stale load signals from the event buffer before each navigation so the
+// buffer check in waitForLoad always sees only the *current* page's event.
+export function clearLoadSignals(cdp, sessionId) {
+  cdp.events = cdp.events.filter(
+    (e) => e.method !== _LOAD_SIGNAL || (sessionId && e.sessionId !== sessionId)
+  );
+}
 
 export function waitForLoad(cdp, sessionId, timeoutMs = 10000) {
-  // Check buffer first — the signal may have already arrived.
+  // Check buffer first — the signal may have already arrived for this navigation.
   const found = cdp.events.find(
-    (e) => _LOAD_SIGNALS.has(e.method) && (!sessionId || e.sessionId === sessionId)
+    (e) => e.method === _LOAD_SIGNAL && (!sessionId || e.sessionId === sessionId)
   );
   if (found) return Promise.resolve();
 
@@ -199,7 +203,7 @@ export function waitForLoad(cdp, sessionId, timeoutMs = 10000) {
     const listener = (event) => {
       if (settled) return;
       const msg = JSON.parse(cdp._decode(event.data));
-      if (_LOAD_SIGNALS.has(msg.method) && (!sessionId || msg.sessionId === sessionId)) {
+      if (msg.method === _LOAD_SIGNAL && (!sessionId || msg.sessionId === sessionId)) {
         finish();
       }
     };

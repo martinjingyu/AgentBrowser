@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { connectPage, connectBrowser, discoverBrowserWs, waitForLoad } from "./cdp.js";
+import { connectPage, connectBrowser, discoverBrowserWs, waitForLoad, clearLoadSignals } from "./cdp.js";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const envPort = process.env.AGENT_BROWSER_PORT ? Number(process.env.AGENT_BROWSER_PORT) : null;
@@ -202,6 +202,7 @@ async function cmdOpen(args) {
   const firstValue = args.find((arg) => !arg.startsWith("--"));
   const url = normalizeUrl(firstValue ?? "about:blank");
   await withPage(async (cdp, sessionId) => {
+    clearLoadSignals(cdp, sessionId);
     await cdp.send("Page.navigate", { url }, sessionId);
     await waitForLoad(cdp, sessionId);
     console.log(`opened ${url}`);
@@ -436,6 +437,7 @@ async function cmdKeyboard(args) {
 
 async function cmdBack() {
   await withPage(async (cdp, sessionId) => {
+    clearLoadSignals(cdp, sessionId);
     await cdp.send("Page.goBack", {}, sessionId);
     await waitForLoad(cdp, sessionId);
     console.log(JSON.stringify({ success: true }));
@@ -546,27 +548,63 @@ function googleResultExtractor() {
 }
 
 function bingResultExtractor() {
+  // Bing wraps real URLs in redirect links: bing.com/ck/a?...&u=a1<base64url>
+  // Decode the u= parameter to get the actual destination URL.
+  function decodeBingUrl(href) {
+    try {
+      const u = new URL(href);
+      const encoded = u.searchParams.get('u');
+      if (encoded && encoded.startsWith('a1')) {
+        const b64 = encoded.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+        const padded = b64 + '='.repeat((4 - b64.length % 4) % 4);
+        return atob(padded);
+      }
+    } catch {}
+    return href;
+  }
+
   const results = [];
   for (const li of document.querySelectorAll('li.b_algo')) {
     const a = li.querySelector('h2 a');
     if (!a || !a.href) continue;
     const title = a.innerText.trim();
+    const url = decodeBingUrl(a.href);
     const snippetEl = li.querySelector('.b_caption p, p.b_lineclamp3, p.b_lineclamp4, .b_algoSlug');
     const snippet = (snippetEl?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 280);
-    results.push({ title, url: a.href, snippet });
+    results.push({ title, url, snippet });
   }
   return results;
 }
 
 function baiduResultExtractor() {
+  // Baidu wraps real URLs in baidu.com/link?url=<base64> redirects.
+  // Real URLs are also stored in data-href / mu attributes on the container.
+  function decodeBaiduUrl(item, fallback) {
+    try {
+      const mu = item.getAttribute('mu') || item.getAttribute('data-href');
+      if (mu && mu.startsWith('http')) return mu;
+      const inner = item.querySelector('[mu], [data-href]');
+      if (inner) {
+        const v = inner.getAttribute('mu') || inner.getAttribute('data-href');
+        if (v && v.startsWith('http')) return v;
+      }
+    } catch {}
+    return fallback;
+  }
+
   const results = [];
   for (const item of document.querySelectorAll('.result, .c-container')) {
     const a = item.querySelector('h3 a, .t a');
-    if (!a || !a.href) continue;
-    const title = a.innerText.trim();
-    const snippetEl = item.querySelector('.c-abstract, .content-right_8Zs40');
+    if (!a) continue;
+    const title = (a.innerText || a.textContent || '').trim();
+    if (!title) continue;
+    const url = decodeBaiduUrl(item, a.href);
+    const snippetEl = item.querySelector(
+      '.c-abstract, .content-right_8Zs40, [class*="abstract"], [class*="desc"], ' +
+      '.c-span9, .c-gap-top-small, span.c-color-text'
+    );
     const snippet = (snippetEl?.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 280);
-    results.push({ title, url: a.href, snippet });
+    results.push({ title, url, snippet });
   }
   return results;
 }
